@@ -81,15 +81,19 @@ const CLOSE_TO_TRAY = process.platform === 'linux'
   && process.env.CLAUDE_QUIT_ON_CLOSE !== '1';
 console.log(`[Frame Fix] Close-to-tray: ${CLOSE_TO_TRAY ? 'on' : 'off'}`);
 
-// Detect if a window intends to be frameless (popup/Quick Entry/About)
-// Quick Entry: titleBarStyle:"", skipTaskbar:true, transparent:true, resizable:false
-// About:       titleBarStyle:"", skipTaskbar:true, resizable:false
-// Main:        titleBarStyle:"", titleBarOverlay:false(linux), resizable (has minWidth)
-// The main window has minWidth set; popups do not.
+// Detect if a window intends to be frameless (popup/Quick Entry/About).
+// Window kinds — see build-reference/app-extracted/.vite/build/index.js:
+//   Quick Entry:    titleBarStyle:"hidden",      frame:false  (caught early)
+//   About:          titleBarStyle:"hiddenInset", no minWidth, no parent
+//   Main:           titleBarStyle:"hidden",      minWidth:600
+//   Hardware Buddy: titleBarStyle:"hiddenInset", parent set (child modal — keep frame)
+// minWidth excludes Main; the `parent` key excludes Hardware Buddy. About
+// went from "" to "hiddenInset" upstream, so the test matches either.
 function isPopupWindow(options) {
   if (!options) return false;
   if (options.frame === false) return true;
-  if (options.titleBarStyle === '' && !options.minWidth) return true;
+  if ('parent' in options) return false;
+  if ((options.titleBarStyle === '' || options.titleBarStyle === 'hiddenInset') && !options.minWidth) return true;
   return false;
 }
 
@@ -116,6 +120,28 @@ const LINUX_CSS = `
     }
   }
 `;
+
+// autoUpdater no-op: every property access returns a chainable function
+// so `.on(...).once(...).setFeedURL(...).checkForUpdates()` is harmless.
+// `getFeedURL` returns '' so any code that inspects the URL gets a
+// well-typed empty string rather than undefined. `then`/`catch`/`finally`
+// and `Symbol.toPrimitive`/`Symbol.iterator` resolve to `undefined` so the
+// Proxy is not mistaken for a thenable (which would call chainNoop as
+// `then(resolve, reject)` and never resolve — silent await hang) or
+// asked to coerce to a primitive. Writes land on the target but are
+// shadowed by the get-trap. Defined once and reused across all
+// require('electron') calls. Linux-only; macOS/Windows still see the
+// real autoUpdater. See #567.
+const autoUpdaterNoop = new Proxy({}, {
+  get(_target, prop) {
+    if (prop === 'getFeedURL') return () => '';
+    if (prop === 'then' || prop === 'catch' || prop === 'finally'
+      || prop === Symbol.toPrimitive || prop === Symbol.iterator) {
+      return undefined;
+    }
+    return function chainNoop() { return autoUpdaterNoop; };
+  },
+});
 
 // Build the patched BrowserWindow class and Menu interceptor once,
 // on first require('electron'), then reuse via Proxy on every access.
@@ -740,6 +766,23 @@ X-GNOME-Autostart-enabled=true
               return Reflect.get(menuTarget, menuProp);
             }
           });
+        }
+        if (prop === 'autoUpdater' && process.platform === 'linux') {
+          // Force autoUpdater into a no-op on Linux. Upstream's bundled
+          // app code sets a feed URL of api.anthropic.com/api/desktop/linux/...
+          // when app.isPackaged is true (we set ELECTRON_FORCE_IS_PACKAGED=true
+          // unconditionally). Today this is a happy accident: Electron's Linux
+          // autoUpdater is unimplemented and logs "AutoUpdater is not supported
+          // on Linux", so the calls no-op. If a future Electron implements it,
+          // every install would start hitting that feed and would either 404
+          // or — worse — receive content the install wasn't prepared for.
+          // .deb/.rpm/AppImage updates flow through the OS package manager
+          // (or AppImageUpdate); the Anthropic feed has no Linux artifacts.
+          // We replace the entire autoUpdater object with a Proxy that
+          // no-ops every method and returns chainable stubs for EventEmitter
+          // calls so listener registration in the bundled code is harmless.
+          // See #567.
+          return autoUpdaterNoop;
         }
         return Reflect.get(target, prop, receiver);
       }

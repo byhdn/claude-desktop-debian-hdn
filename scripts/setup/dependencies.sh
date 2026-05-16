@@ -22,31 +22,50 @@ check_dependencies() {
 		rpm) all_deps="$all_deps rpmbuild" ;;
 	esac
 
+	# node-pty has a native C++ module compiled via node-gyp during
+	# `npm install`. Without gcc/g++/make/python3 the install silently
+	# emits a warning, leaves pty_src_dir empty, and the build ends up
+	# shipping the upstream Windows binaries (the #401 failure mode).
+	# Skip when --node-pty-dir is set (Nix and explicit overrides bring
+	# their own pre-built node-pty).
+	if [[ -z ${node_pty_dir:-} ]]; then
+		all_deps="$all_deps gcc g++ make python3"
+	fi
+
 	# Command-to-package mappings per distro family
 	declare -A debian_pkgs=(
 		[p7zip]='p7zip-full' [wget]='wget' [wrestool]='icoutils'
 		[icotool]='icoutils' [convert]='imagemagick'
 		[dpkg-deb]='dpkg-dev' [rpmbuild]='rpm'
+		[gcc]='build-essential' [g++]='build-essential'
+		[make]='build-essential' [python3]='python3'
 	)
 	declare -A rpm_pkgs=(
 		[p7zip]='p7zip p7zip-plugins' [wget]='wget' [wrestool]='icoutils'
 		[icotool]='icoutils' [convert]='ImageMagick'
 		[dpkg-deb]='dpkg' [rpmbuild]='rpm-build'
+		[gcc]='gcc' [g++]='gcc-c++'
+		[make]='make' [python3]='python3'
 	)
 
-	local cmd
+	local cmd pkg
 	for cmd in $all_deps; do
 		if ! check_command "$cmd"; then
 			case "$distro_family" in
-				debian)
-					deps_to_install="$deps_to_install ${debian_pkgs[$cmd]}"
-					;;
-				rpm)
-					deps_to_install="$deps_to_install ${rpm_pkgs[$cmd]}"
-					;;
+				debian) pkg="${debian_pkgs[$cmd]}" ;;
+				rpm)    pkg="${rpm_pkgs[$cmd]}" ;;
 				*)
 					echo "Warning: Cannot auto-install '$cmd' on unknown distro. Please install manually." >&2
+					continue
 					;;
+			esac
+			# Several commands map to the same package (gcc/g++/make
+			# -> build-essential, wrestool/icotool -> icoutils). Skip
+			# if the package is already queued so the log line stays
+			# readable.
+			case " $deps_to_install " in
+				*" $pkg "*) ;;
+				*) deps_to_install="$deps_to_install $pkg" ;;
 			esac
 		fi
 	done
@@ -198,6 +217,13 @@ setup_nodejs() {
 setup_electron_asar() {
 	section_header 'Electron & Asar Handling'
 
+	# Pin Electron to the exact version upstream Claude Desktop ships
+	# (build-reference/app-extracted/package.json). The shipped app.asar
+	# binds to specific V8/NAPI ABI, Chromium pairing, and node-pty
+	# native surface — running a different Electron major against this
+	# asar is unsupported. Bump when upstream bumps.
+	local electron_version='41.5.0'
+
 	echo "Ensuring local Electron and Asar installation in $work_dir..."
 	cd "$work_dir" || exit 1
 
@@ -214,17 +240,34 @@ setup_electron_asar() {
 	[[ ! -f $asar_bin_path ]] && echo 'Asar binary not found.' && install_needed=true
 
 	if [[ $install_needed == true ]]; then
-		echo "Installing Electron and Asar locally into $work_dir..."
-		# Pin to electron 41.x: electron@42.0.0 (2026-05-06) dropped the
-		# postinstall that fetches the prebuilt binary into dist/, leaving
-		# node_modules/electron/dist absent and the build aborting (#584).
-		# A durable fix using @electron/get is tracked separately.
-		if ! npm install --no-save 'electron@^41' @electron/asar; then
+		echo "Installing electron@${electron_version} and Asar locally into $work_dir..."
+		if ! npm install --no-save \
+			"electron@${electron_version}" @electron/asar @electron/get extract-zip; then
 			echo 'Failed to install Electron and/or Asar locally.' >&2
 			cd "$project_root" || exit 1
 			exit 1
 		fi
 		echo 'Electron and Asar installation command finished.'
+
+		# electron@42+ no longer ships a postinstall script that fetches
+		# the prebuilt binary into dist/. If npm didn't populate it, fetch
+		# the matching binary explicitly via @electron/get. See #584.
+		# Retry once on transient CDN failures (503, network drops).
+		if [[ ! -d $electron_dist_path ]]; then
+			echo 'Electron postinstall did not populate dist/; fetching binary explicitly...'
+			local fetch_attempts=0
+			while ! node "$project_root/scripts/setup/fetch-electron-binary.js"; do
+				fetch_attempts=$((fetch_attempts + 1))
+				if (( fetch_attempts >= 2 )); then
+					echo 'Failed to fetch Electron binary via @electron/get after 2 attempts.' >&2
+					echo 'For air-gapped or mirrored builds set ELECTRON_MIRROR or ELECTRON_CUSTOM_DIR; see docs/BUILDING.md.' >&2
+					cd "$project_root" || exit 1
+					exit 1
+				fi
+				echo "Retrying Electron binary fetch (attempt $((fetch_attempts + 1))/2)..."
+				sleep 2
+			done
+		fi
 	else
 		echo 'Local Electron distribution and Asar binary already present.'
 	fi
